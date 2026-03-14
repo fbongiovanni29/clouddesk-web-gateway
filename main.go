@@ -1,26 +1,42 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
-type route struct {
-	prefix string
-	target string
+// serviceStatus holds the result of probing a single upstream.
+type serviceStatus struct {
+	Status string `json:"status"` // "ok" or "unavailable"
+}
+
+// healthzResponse is the full /healthz payload.
+type healthzResponse struct {
+	Status   string                   `json:"status"`
+	Services map[string]serviceStatus `json:"services"`
 }
 
 func main() {
-	authURL := envOrDefault("AUTH_SERVICE_URL", "http://localhost:8081")
-	docsURL := envOrDefault("DOCS_API_URL", "http://localhost:8082")
+	authURL := envOrDefault("AUTH_SERVICE_URL", "http://clouddesk-auth-service.default.svc:8080")
+	docsURL := envOrDefault("DOCS_API_URL", "http://clouddesk-docs-api.default.svc:8080")
+	notifURL := envOrDefault("NOTIFICATIONS_SERVICE_URL", "http://clouddesk-notifications-worker.default.svc:8080")
+
+	type route struct {
+		prefix string
+		target string
+	}
 
 	routes := []route{
 		{prefix: "/auth/", target: authURL},
-		{prefix: "/api/docs", target: docsURL},
+		{prefix: "/docs/", target: docsURL},
+		{prefix: "/notifications/", target: notifURL},
 	}
 
 	mux := http.NewServeMux()
@@ -31,10 +47,52 @@ func main() {
 		log.Printf("route %s -> %s", r.prefix, r.target)
 	}
 
+	// /healthz — probe each upstream and report status
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		services := map[string]string{
+			"auth":          authURL,
+			"docs":          docsURL,
+			"notifications": notifURL,
+		}
+
+		statuses := make(map[string]serviceStatus, len(services))
+		overallOK := true
+
+		client := &http.Client{Timeout: 3 * time.Second}
+		for name, base := range services {
+			probe := strings.TrimRight(base, "/") + "/healthz"
+			resp, err := client.Get(probe)
+			if err != nil || resp.StatusCode >= 500 {
+				statuses[name] = serviceStatus{Status: "unavailable"}
+				overallOK = false
+			} else {
+				statuses[name] = serviceStatus{Status: "ok"}
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}
+
+		overall := "ok"
+		if !overallOK {
+			overall = "degraded"
+		}
+
+		payload := healthzResponse{
+			Status:   overall,
+			Services: statuses,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(payload)
+	})
+
+	// / — service discovery / status
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"service":"web-gateway","status":"ok","routes":["/auth/","/api/docs"]}`))
+		fmt.Fprint(w, `{"service":"web-gateway","status":"ok","routes":["/auth/","/docs/","/notifications/","/healthz"]}`)
 	})
 
 	log.Println("web-gateway listening on :8080")
@@ -56,6 +114,7 @@ func newProxy(target, prefix string) http.Handler {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy error for %s: %v", r.URL.Path, err)
+			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"upstream unavailable"}`, http.StatusBadGateway)
 		},
 	}
